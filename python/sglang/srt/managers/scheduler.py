@@ -2230,6 +2230,20 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if self.spec_algorithm.is_frozen_kv_mtp() and use_mlx():
+            from sglang.srt.hardware_backend.mlx.spec_config import (
+                validate_mlx_frozen_kv_mtp_request,
+            )
+
+            error_msg = validate_mlx_frozen_kv_mtp_request(
+                req, has_multimodal=recv_req.mm_inputs is not None
+            )
+            if error_msg is not None:
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
+
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
