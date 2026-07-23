@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict
+from pathlib import Path
 from unittest import mock
 
 import mlx.core as mx
@@ -141,3 +143,67 @@ def assert_native_cache_equal(testcase, actual, expected) -> None:
             else:
                 np.testing.assert_array_equal(left["keys"], right["keys"])
                 np.testing.assert_array_equal(left["values"], right["values"])
+
+
+def tiny_assistant_config(*, ordered: bool = False) -> dict:
+    """Return a provider-compatible assistant config for the tiny target."""
+
+    return {
+        "architectures": ["Gemma4AssistantForCausalLM"],
+        "model_type": "gemma4_assistant",
+        "backbone_hidden_size": 16,
+        "tie_word_embeddings": True,
+        "use_ordered_embeddings": ordered,
+        "num_centroids": 4 if ordered else 0,
+        "centroid_intermediate_top_k": 2 if ordered else 0,
+        "text_config": {
+            "model_type": "gemma4_text",
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "head_dim": 4,
+            "global_head_dim": 8,
+            "vocab_size": 32,
+            "vocab_size_per_layer_input": 0,
+            "num_key_value_heads": 1,
+            "num_global_key_value_heads": 1,
+            "num_kv_shared_layers": 4,
+            "hidden_size_per_layer_input": 0,
+            "sliding_window": 8,
+            "sliding_window_pattern": 2,
+            "max_position_embeddings": 4096,
+            "attention_k_eq_v": False,
+            "use_double_wide_mlp": False,
+            "final_logit_softcapping": None,
+            "tie_word_embeddings": True,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+        },
+    }
+
+
+def write_tiny_assistant_checkpoint(directory: Path, *, ordered: bool = False) -> dict:
+    """Write deterministic provider weights without network access."""
+
+    from mlx.utils import tree_flatten
+    from mlx_vlm.speculative.drafters.gemma4_assistant.config import (
+        Gemma4AssistantConfig,
+    )
+    from mlx_vlm.speculative.drafters.gemma4_assistant.gemma4_assistant import (
+        Gemma4AssistantDraftModel,
+    )
+
+    directory.mkdir(parents=True, exist_ok=True)
+    config = tiny_assistant_config(ordered=ordered)
+    (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    model = Gemma4AssistantDraftModel(Gemma4AssistantConfig.from_dict(config))
+    mx.save_safetensors(
+        str(directory / "model.safetensors"),
+        dict(tree_flatten(model.parameters())),
+    )
+    return config
