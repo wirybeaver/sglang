@@ -1140,7 +1140,13 @@ class Scheduler(
             server_args=self.server_args,
         )
 
-        if self.spec_algorithm.carries_draft_hidden_states():
+        worker_carries_draft_hidden = getattr(
+            self.draft_worker, "carries_draft_hidden_states", lambda: True
+        )()
+        if (
+            self.spec_algorithm.carries_draft_hidden_states()
+            and worker_carries_draft_hidden
+        ):
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
             # worker, so a single accessor covers both shapes.
             draft_runner = self.draft_worker.draft_worker.draft_runner

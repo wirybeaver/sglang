@@ -62,6 +62,10 @@ def get_draft_kv_pool(
     if draft_worker is None or spec_algorithm.is_ngram():
         return None
 
+    get_worker_pool = getattr(draft_worker, "get_draft_kv_pool", None)
+    if get_worker_pool is not None:
+        return get_worker_pool()
+
     # V2 workers nest the draft runner under `.draft_worker`.
     if server_args.enable_multi_layer_eagle:
         draft_runner = draft_worker.draft_worker.draft_runner_list[0]

@@ -159,6 +159,45 @@ class MlxTpModelWorker(TpModelWorker):
                 self._mlx_runner.remove_request(req.rid)
                 self._mlx_active_rids.discard(req.rid)
 
+    def clear_cache_pool(self) -> None:
+        """Clear native request state; scheduler-owned stub pools clear separately."""
+
+        self._mlx_runner.clear()
+        self._mlx_active_rids.clear()
+
+    def forward_batch_generation_mtp_prefill(self, batch: ScheduleBatch):
+        """Run the BS=1 final prefill while retaining target hidden rows."""
+
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+        self._ensure_mlx_pool_initialized()
+        if not batch.forward_mode.is_extend() or len(batch.reqs) != 1:
+            raise ValueError("MLX Gemma 4 MTP prefill requires one extend request")
+        req = batch.reqs[0]
+        self._cleanup_stale_rids(batch.forward_mode, {req.rid})
+        if self._mlx_runner.has_request(req.rid):
+            raise ValueError("MLX Gemma 4 MTP does not support chunked prefill")
+
+        input_ids = batch.input_ids.cpu().tolist()
+        if len(input_ids) != int(batch.extend_lens[0]):
+            raise ValueError("MLX Gemma 4 MTP prefill input length is inconsistent")
+        token, target_output = self._mlx_runner.prefill_for_mtp(
+            req_id=req.rid,
+            new_token_ids=input_ids,
+            full_token_ids=list(req.get_fill_ids()),
+            prefix_slot_ids=req.prefix_indices.tolist(),
+            new_slot_ids=batch.out_cache_loc.cpu().tolist(),
+            req_pool_idx=req.req_pool_idx,
+            req=req,
+        )
+        self._mlx_active_rids.add(req.rid)
+        result = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(next_token_logits=None),
+            next_token_ids=torch.tensor([token], dtype=torch.long, device="cpu"),
+            can_run_cuda_graph=False,
+        )
+        return result, target_output
+
     def _route_extend_request(self, rid: str, decoding_rids: set[str]) -> str:
         """Classify a request within an extend / mixed batch.
 
