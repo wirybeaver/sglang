@@ -133,6 +133,9 @@ class MlxFrozenKVMTPWorker(BaseSpecWorker):
         )
         self._proposer = MlxGemma4MTPProposer(self._assistant_runtime)
         self._active_rids: set[str] = set()
+        self._proposed_tokens = 0
+        self._verified_tokens = 0
+        self._accepted_draft_tokens = 0
 
     @property
     def draft_worker(self):
@@ -143,6 +146,22 @@ class MlxFrozenKVMTPWorker(BaseSpecWorker):
 
     def get_draft_kv_pool(self):
         return None
+
+    def get_speculative_internal_state(self) -> dict[str, object]:
+        """Return JSON-safe activation and request-lifecycle counters."""
+
+        return {
+            "implementation": "mlx_gemma4_frozen_kv_mtp",
+            "proposed_tokens": self._proposed_tokens,
+            "verified_tokens": self._verified_tokens,
+            "accepted_draft_tokens": self._accepted_draft_tokens,
+            "assistant_generation": self._assistant_loader.generation,
+            "active_request_count": len(self._active_rids),
+            "native_request_count": len(self._native_runner._req_caches),
+            "assistant_request_binding_count": (
+                self._assistant_runtime.request_binding_count
+            ),
+        }
 
     def alloc_memory_pool(
         self,
@@ -207,6 +226,7 @@ class MlxFrozenKVMTPWorker(BaseSpecWorker):
         proposal = int(self._proposer.propose_one(request_id, seed, cache))
         if proposal < 0 or proposal >= self._target_adapter.vocab_size:
             raise ValueError("assistant proposal is outside the target vocabulary")
+        self._proposed_tokens += 1
         return proposal
 
     def _forward_prefill(self, batch: ScheduleBatch) -> GenerationBatchResult:
@@ -273,6 +293,8 @@ class MlxFrozenKVMTPWorker(BaseSpecWorker):
                 cache=candidate_cache,
             )
             self._native_runner.verify_commit(pending, decision)
+            self._verified_tokens += 1
+            self._accepted_draft_tokens += int(decision.accepted_draft)
         except BaseException:
             if pending is not None:
                 self._native_runner.verify_abort(pending)
