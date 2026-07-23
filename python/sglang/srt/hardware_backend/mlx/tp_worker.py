@@ -53,6 +53,7 @@ class MlxTpModelWorker(TpModelWorker):
         logger.info("Initializing MlxModelRunner for end-to-end MLX inference")
         init_kwargs = dict(
             model_path=get_model().model_path,
+            revision=getattr(self.server_args, "revision", None),
             trust_remote_code=get_model().trust_remote_code,
             disable_radix_cache=get_memory().disable_radix_cache,
             mem_fraction_static=get_schedule().mem_fraction_static,
