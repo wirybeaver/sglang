@@ -43,6 +43,11 @@ class EagleDraftWorkerBase(ABC):
 
 
 class BaseSpecWorker(ABC):
+    def carries_draft_hidden_states(self) -> bool:
+        """Whether disaggregation may dereference a Torch draft runner."""
+
+        return True
+
     @property
     def target_worker(self) -> TpModelWorker:
         return self._target_worker
