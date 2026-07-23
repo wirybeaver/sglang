@@ -178,7 +178,7 @@ class TestMlxFrozenKVMTPWorker(unittest.TestCase):
         target_worker._mlx_pool_initialized = True
         target_worker._model_runner = SimpleNamespace()
         runtime = _ScriptedRuntime()
-        loader = SimpleNamespace(load=mock.Mock(return_value=runtime))
+        loader = SimpleNamespace(load=mock.Mock(return_value=runtime), generation=1)
         server_args = SimpleNamespace(
             speculative_draft_model_path="unused",
             speculative_draft_model_revision="pinned",
@@ -256,6 +256,19 @@ class TestMlxFrozenKVMTPWorker(unittest.TestCase):
                 self.assertEqual(request.kv_committed_len, 17 + len(emitted))
                 self.assertEqual(request.spec_verify_ct, 1)
                 self.assertEqual(request.spec_num_correct_drafts, len(emitted) - 1)
+                self.assertEqual(
+                    worker.get_speculative_internal_state(),
+                    {
+                        "implementation": "mlx_gemma4_frozen_kv_mtp",
+                        "proposed_tokens": 2,
+                        "verified_tokens": 1,
+                        "accepted_draft_tokens": int(accepted),
+                        "assistant_generation": 1,
+                        "active_request_count": 1,
+                        "native_request_count": 1,
+                        "assistant_request_binding_count": 1,
+                    },
+                )
 
     def test_proposal_failure_does_not_publish_prepared_cache(self):
         prompt = list(range(1, 18))
@@ -317,6 +330,16 @@ class TestMlxFrozenKVMTPWorker(unittest.TestCase):
         self.assertFalse(runner.has_request(request.rid))
         self.assertEqual(runtime.request_binding_count, 0)
         self.assertNotIn(request.rid, worker._active_rids)
+        state = worker.get_speculative_internal_state()
+        self.assertEqual(state["assistant_generation"], 1)
+        self.assertEqual(
+            (
+                state["active_request_count"],
+                state["native_request_count"],
+                state["assistant_request_binding_count"],
+            ),
+            (0, 0, 0),
+        )
 
 
 class TestMlxCpuBookkeeping(unittest.TestCase):

@@ -87,6 +87,64 @@ The MLX backend supports two quantization paths on Apple Silicon:
    ```
    The MLX backend silently ignores `--quantization mlx_q4` when the model is already quantized in its HF config (path 1), so the same flag is safe to pass either way.
 
+## Experimental Gemma 4 Frozen-KV MTP
+
+The MLX backend has a correctness-first, one-token MTP prototype for Gemma 4
+E2B. It is experimental: batching, overlap scheduling, radix/prefix reuse,
+paged KV cache, and performance claims are out of scope.
+
+Install the pinned assistant provider:
+
+```bash
+uv pip install "mlx-vlm==0.5.0"
+```
+
+Launch the tested target and assistant revisions with the complete Level 1
+configuration:
+
+```bash
+SGLANG_USE_MLX=1 python -m sglang.launch_server \
+  --model-path mlx-community/gemma-4-e2b-it-4bit \
+  --revision 238767527555cb75a05732a84dff5d6ba0dd6809 \
+  --speculative-algorithm FROZEN_KV_MTP \
+  --speculative-draft-model-path mlx-community/gemma-4-E2B-it-assistant-bf16 \
+  --speculative-draft-model-revision a7770799b560135ebdbfae8b7f468947415003bc \
+  --speculative-num-steps 1 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 2 \
+  --disable-radix-cache \
+  --disable-overlap-schedule \
+  --chunked-prefill-size -1 \
+  --max-running-requests 1 \
+  --context-length 2048 \
+  --max-total-tokens 2048
+```
+
+Every request must set `temperature` to `0` explicitly. Do not add
+`--language-only`; this prototype is already text-only, while that flag selects
+an unsupported encoder-disaggregation mode.
+
+Confirm activation after a request with:
+
+```bash
+curl -s http://127.0.0.1:30000/server_info \
+  | jq '.internal_states[0].speculative_worker'
+```
+
+The state reports `implementation: "mlx_gemma4_frozen_kv_mtp"` and positive
+`proposed_tokens` and `verified_tokens`. After completion or
+`POST /flush_cache`, `active_request_count`, `native_request_count`, and
+`assistant_request_binding_count` return to zero; flushing retains the same
+`assistant_generation`.
+
+Keep the prototype constraints in place: the exact text-only E2B pair; greedy
+decoding with one proposal, one step, top-k 1, and verify width 2; one request
+on one Apple host; synchronous scheduling; radix cache and chunked prefill
+disabled; and context length no greater than 2,048. If `--max-total-tokens` is
+set, it must be at least the context length. Sampling penalties, logprobs,
+structured output, custom logits processors, sessions, LoRA, multimodal input,
+and distributed execution are rejected.
+
 ## Benchmarking with Requests
 
 `sglang.benchmark_one_batch` calls the synchronous prefill/decode methods directly without going through the scheduler and the overlap code path.

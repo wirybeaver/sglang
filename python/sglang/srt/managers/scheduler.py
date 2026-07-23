@@ -3956,6 +3956,12 @@ class Scheduler(
                 / self.metrics_reporter.spec_total_num_forward_ct
             )
 
+        get_speculative_state = getattr(
+            self.draft_worker, "get_speculative_internal_state", None
+        )
+        if callable(get_speculative_state):
+            ret["speculative_worker"] = get_speculative_state()
+
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
 
