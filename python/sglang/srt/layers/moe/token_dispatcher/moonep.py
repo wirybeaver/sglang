@@ -15,17 +15,100 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import DeepEPMode
 
-
-_MOONEP_UNSUPPORTED_MESSAGE = (
-    "MoonEP MoE A2A is recognized by SGLang, but the runtime dispatcher is not "
-    "implemented yet. MoonEP is not a drop-in DeepEP-compatible backend: it "
-    "returns a MoonEPCommPlan/cu_seqlens and requires MoonEP-compatible "
-    "contiguous symmetric-memory expert weights plus a VM-group expert GEMM."
+_MOONEP_SPLIT_PHASE_UNSUPPORTED_MESSAGE = (
+    "The current SGLang MoonEP BF16 reference path supports synchronous/eager "
+    "dispatch, weight prefetch, and combine only; split-phase/overlap methods "
+    "are not implemented. MoonEP uses a distinct dispatch format and is not "
+    "wire-compatible with DeepEP."
 )
+_MOONEP_CANONICAL_LAYOUT_UNSUPPORTED_MESSAGE = (
+    "The current SGLang MoonEP BF16 reference path requires canonical [Gate, Up] "
+    "unquantized expert storage; the selected MoE weight method uses a transformed "
+    "expert layout."
+)
+_MOONEP_HETEROGENEOUS_EXPERT_OWNERSHIP_UNSUPPORTED_MESSAGE = (
+    "The current SGLang MoonEP BF16 reference path requires all routed experts in "
+    "global GPU expert storage and does not support heterogeneous CPU/GPU expert "
+    "ownership."
+)
+
+
+def validate_moonep_reference_bf16_weight_layout(
+    *,
+    quant_method: Any,
+    layer: torch.nn.Module | None = None,
+) -> None:
+    """Reject weight methods whose post-load storage is not canonical [Gate, Up]."""
+
+    method = quant_method
+    while True:
+        if getattr(method, "override_num_local_experts", False):
+            raise NotImplementedError(
+                _MOONEP_HETEROGENEOUS_EXPERT_OWNERSHIP_UNSUPPORTED_MESSAGE
+            )
+        gpu_method = getattr(method, "gpu_method", None)
+        if gpu_method is None:
+            break
+        method = gpu_method
+
+    if getattr(method, "load_up_proj_weight_first", False):
+        raise NotImplementedError(_MOONEP_CANONICAL_LAYOUT_UNSUPPORTED_MESSAGE)
+
+    has_transformed_layout = getattr(
+        method, "has_transformed_expert_weight_layout", None
+    )
+    if callable(has_transformed_layout) and has_transformed_layout(layer):
+        raise NotImplementedError(_MOONEP_CANONICAL_LAYOUT_UNSUPPORTED_MESSAGE)
+
+
+def validate_moonep_reference_bf16_config(
+    *,
+    quant_config: Any,
+    params_dtype: torch.dtype | None,
+    num_fused_shared_experts: int,
+    with_bias: bool,
+    activation: str,
+    quant_method: Any | None = None,
+    layer: torch.nn.Module | None = None,
+) -> None:
+    """Validate the current SGLang MoonEP BF16 reference-path contract."""
+
+    if quant_config is not None:
+        raise NotImplementedError(
+            "The current SGLang MoonEP BF16 reference path supports unquantized "
+            "expert weights only; "
+            "quant_config must be None."
+        )
+    if params_dtype is not torch.bfloat16:
+        raise NotImplementedError(
+            "The current SGLang MoonEP BF16 reference path requires "
+            "params_dtype=torch.bfloat16, "
+            f"got {params_dtype!r}."
+        )
+    if num_fused_shared_experts != 0:
+        raise NotImplementedError(
+            "The current SGLang MoonEP BF16 reference path does not support "
+            "fused shared experts yet."
+        )
+    if with_bias:
+        raise NotImplementedError(
+            "The current SGLang MoonEP BF16 reference path does not support "
+            "expert bias; use with_bias=False."
+        )
+    if activation != "silu":
+        raise NotImplementedError(
+            "The current SGLang MoonEP BF16 reference expert runner supports "
+            "SiLU only; production "
+            "Kimi-K3 SiTU compute is not wired through this PoC."
+        )
+    if quant_method is not None:
+        validate_moonep_reference_bf16_weight_layout(
+            quant_method=quant_method,
+            layer=layer,
+        )
 
 
 class MoonEPDispatchOutput(NamedTuple):
@@ -40,7 +123,6 @@ class MoonEPDispatchOutput(NamedTuple):
     route_weights_nvs: Optional[torch.Tensor]
     cu_seqlens: torch.Tensor
     plan: Any
-    expert_ids: torch.Tensor
     num_tokens: int
 
     @property
@@ -118,9 +200,26 @@ class MoonEPBuffer:
             state = SimpleNamespace(
                 buffers={},
                 active_key=None,
+                cleanup_registered=False,
             )
             buffers["moonep_ep_state"] = state
         return state
+
+    @classmethod
+    def _ensure_cleanup_registered(cls, state) -> None:
+        from sglang.srt.runtime_context import (
+            register_distributed_resource_cleanup,
+        )
+
+        if state.cleanup_registered:
+            return
+
+        def cleanup_moonep_buffers() -> None:
+            cls.destroy_all_buffers()
+            state.cleanup_registered = False
+
+        register_distributed_resource_cleanup(cleanup_moonep_buffers)
+        state.cleanup_registered = True
 
     @staticmethod
     def _require_positive_int(name: str, value: int) -> int:
@@ -275,6 +374,17 @@ class MoonEPBuffer:
         )
         state.buffers[key] = buffer
         state.active_key = key
+        try:
+            cls._ensure_cleanup_registered(state)
+        except Exception:
+            try:
+                cls.destroy_buffer(key)
+            except Exception as destroy_exc:
+                raise RuntimeError(
+                    "MoonEP buffer was allocated but cleanup registration failed, "
+                    "and destroying the new buffer also failed."
+                ) from destroy_exc
+            raise
         return buffer
 
     @classmethod
@@ -285,10 +395,13 @@ class MoonEPBuffer:
         if key is None:
             return
 
-        buffer = state.buffers.pop(key, None)
+        buffer = state.buffers.get(key)
+        if buffer is None:
+            return
         destroy = getattr(buffer, "destroy", None)
         if callable(destroy):
             destroy()
+        state.buffers.pop(key, None)
         if state.active_key == key:
             state.active_key = next(reversed(state.buffers), None)
 
@@ -297,7 +410,8 @@ class MoonEPBuffer:
         state = cls._state()
         for key in list(state.buffers):
             cls.destroy_buffer(key)
-        state.active_key = None
+        if not state.buffers:
+            state.active_key = None
 
 
 def get_moonep_num_prefetch_slots(num_experts: int, num_ep_ranks: int) -> int:
@@ -314,10 +428,10 @@ def get_moonep_expert_weight_layout(
 ) -> MoonEPExpertWeightLayout:
     """Return cached contiguous BF16 gate/up/down tensors for MoonEP.
 
-    The first executable PoC path supports only unquantized BF16 weights stored
-    in global expert-id order.  Rows ``[E, E+B)`` are mutable prefetch slots and
-    are intentionally preserved across calls so ``buffer.prefetch_weight`` can
-    fill them before the MoonEP expert runner consumes the layout.
+    The current SGLang MoonEP BF16 reference path uses unquantized BF16 weights
+    stored in global expert-id order. Rows ``[E, E+B)`` are mutable prefetch
+    slots and are intentionally preserved across calls so ``buffer.prefetch_weight``
+    can fill them before the MoonEP expert runner consumes the layout.
     """
 
     if num_prefetch_slots <= 0:
@@ -325,29 +439,29 @@ def get_moonep_expert_weight_layout(
             f"num_prefetch_slots must be positive, got {num_prefetch_slots}"
         )
 
-    quant_config = getattr(layer, "quant_config", None)
-    if quant_config is not None:
-        raise NotImplementedError(
-            "MoonEP PoC expert weight layout supports unquantized BF16 only."
-        )
-
-    if getattr(layer.moe_runner_config, "num_fused_shared_experts", 0) != 0:
-        raise NotImplementedError(
-            "MoonEP PoC does not support fused shared experts yet."
-        )
-    if not getattr(layer.moe_runner_config, "is_gated", True):
-        raise NotImplementedError("MoonEP PoC requires gated w13 experts.")
-    if getattr(layer, "use_triton_kernels", False):
-        raise NotImplementedError(
-            "MoonEP PoC expects canonical [E, 2I, H] w13 layout, not "
-            "triton-kernels transposed weight layout."
-        )
-
     w13_weight = layer.w13_weight
     w2_weight = layer.w2_weight
+    moe_runner_config = layer.moe_runner_config
+    validate_moonep_reference_bf16_config(
+        quant_config=getattr(layer, "quant_config", None),
+        params_dtype=getattr(layer, "params_dtype", w13_weight.dtype),
+        num_fused_shared_experts=getattr(
+            moe_runner_config, "num_fused_shared_experts", 0
+        ),
+        with_bias=getattr(layer, "with_bias", False),
+        activation=getattr(moe_runner_config, "activation", "silu"),
+        quant_method=getattr(layer, "quant_method", None),
+        layer=layer,
+    )
+    if not getattr(layer.moe_runner_config, "is_gated", True):
+        raise NotImplementedError(
+            "The current SGLang MoonEP BF16 reference path requires gated "
+            "w13 experts."
+        )
     if w13_weight.dtype != torch.bfloat16 or w2_weight.dtype != torch.bfloat16:
         raise NotImplementedError(
-            "MoonEP PoC expert runner supports BF16 weights only."
+            "The current SGLang MoonEP BF16 reference expert runner supports "
+            "BF16 weights only."
         )
     if not w13_weight.is_contiguous() or not w2_weight.is_contiguous():
         raise ValueError("MoonEP expert source weights must be contiguous.")
@@ -359,12 +473,14 @@ def get_moonep_expert_weight_layout(
     expected_w2_shape = (num_experts, hidden_size, intermediate_size)
     if tuple(w13_weight.shape) != expected_w13_shape:
         raise ValueError(
-            "MoonEP PoC requires global w13_weight shape "
+            "The current SGLang MoonEP BF16 reference path requires global "
+            "w13_weight shape "
             f"{expected_w13_shape}, got {tuple(w13_weight.shape)}."
         )
     if tuple(w2_weight.shape) != expected_w2_shape:
         raise ValueError(
-            "MoonEP PoC requires global w2_weight shape "
+            "The current SGLang MoonEP BF16 reference path requires global "
+            "w2_weight shape "
             f"{expected_w2_shape}, got {tuple(w2_weight.shape)}."
         )
 
@@ -422,64 +538,51 @@ def run_moonep_bf16_expert(
 ) -> MoonEPCombineInput:
     """Run a simple BF16 MoonEP expert core over ``cu_seqlens`` segments.
 
-    This is a correctness-first PoC runner.  It consumes MoonEP's already
+    This is a correctness-first reference runner. It consumes MoonEP's already
     expert-grouped ``[NvS, H]`` token layout, applies gate/up/down expert
-    weights for each non-empty `cu_seqlens` segment, multiplies each dispatched
-    row by its route weight, and returns a `MoonEPCombineInput` for
-    `MoonEPDispatcher.combine`.
+    weights from the physical row with the same group index for each non-empty
+    `cu_seqlens` segment, multiplies each dispatched row by its route weight,
+    and returns a `MoonEPCombineInput` for `MoonEPDispatcher.combine`.
     """
 
     if activation != "silu":
         raise NotImplementedError(
-            f"MoonEP BF16 PoC runner only supports silu, got {activation!r}"
+            "The current SGLang MoonEP BF16 reference expert runner supports "
+            "SiLU only; production "
+            f"Kimi-K3 SiTU compute is not wired through this PoC (got {activation!r})."
         )
 
     hidden_states = dispatch_output.hidden_states
     route_weights_nvs = dispatch_output.route_weights_nvs
     cu_seqlens = dispatch_output.cu_seqlens
-    expert_ids = dispatch_output.expert_ids
-
-    if hidden_states.ndim != 2:
+    gate_weight = weight_layout.full_gate_weight
+    up_weight = weight_layout.full_up_weight
+    down_weight = weight_layout.full_down_weight
+    if cu_seqlens.numel() != gate_weight.shape[0]:
         raise ValueError(
-            f"MoonEP hidden states must be [NvS, H], got {hidden_states.shape}"
-        )
-    if cu_seqlens.ndim != 1:
-        raise ValueError(f"cu_seqlens must be 1D, got {cu_seqlens.shape}")
-    if expert_ids.shape != cu_seqlens.shape:
-        raise ValueError(
-            f"expert_ids shape {expert_ids.shape} must match cu_seqlens "
-            f"shape {cu_seqlens.shape}"
-        )
-    if route_weights_nvs is not None and route_weights_nvs.ndim != 1:
-        raise ValueError(
-            f"route_weights_nvs must be 1D, got {route_weights_nvs.shape}"
+            "MoonEP cu_seqlens must contain one physical VM-group row per "
+            "weight row: "
+            f"groups={cu_seqlens.numel()}, weight_rows={gate_weight.shape[0]}"
         )
 
     output = torch.empty_like(hidden_states)
     prev = 0
     for group_id in range(cu_seqlens.numel()):
         cur = int(cu_seqlens[group_id].item())
-        if cur < prev:
-            raise ValueError("MoonEP cu_seqlens must be non-decreasing")
+        if cur < prev or cur > hidden_states.shape[0]:
+            raise ValueError(
+                "MoonEP cu_seqlens must be non-decreasing and within "
+                f"dispatched rows: previous={prev}, current={cur}, "
+                f"rows={hidden_states.shape[0]}"
+            )
         if cur == prev:
             continue
 
-        expert_id = int(expert_ids[group_id].item())
-        if expert_id < 0:
-            output[prev:cur].zero_()
-            prev = cur
-            continue
-        if expert_id >= weight_layout.full_gate_weight.shape[0]:
-            raise ValueError(
-                f"expert_id {expert_id} exceeds MoonEP weight rows "
-                f"{weight_layout.full_gate_weight.shape[0]}"
-            )
-
         x = hidden_states[prev:cur]
-        gate = F.linear(x, weight_layout.full_gate_weight[expert_id])
-        up = F.linear(x, weight_layout.full_up_weight[expert_id])
+        gate = F.linear(x, weight_layout.full_gate_weight[group_id])
+        up = F.linear(x, weight_layout.full_up_weight[group_id])
         activated = F.silu(gate) * up
-        y = F.linear(activated, weight_layout.full_down_weight[expert_id])
+        y = F.linear(activated, weight_layout.full_down_weight[group_id])
         if route_weights_nvs is not None:
             y = y * route_weights_nvs[prev:cur].to(dtype=y.dtype).unsqueeze(-1)
         output[prev:cur].copy_(y)
@@ -497,7 +600,7 @@ def run_moonep_bf16_expert(
 
 
 class MoonEPDispatcher(BaseDispatcher):
-    """MoonEP dispatcher for the initial BF16 inference PoC."""
+    """Dispatcher for the current SGLang MoonEP BF16 reference path."""
 
     def __init__(
         self,
@@ -527,11 +630,20 @@ class MoonEPDispatcher(BaseDispatcher):
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
+        if self.num_max_dispatch_tokens_per_rank <= 0:
+            raise ValueError(
+                "SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK must be positive, "
+                f"got {self.num_max_dispatch_tokens_per_rank}."
+            )
         self.num_prefetch_slots = None
 
     @staticmethod
-    def _raise_unimplemented() -> NoReturn:
-        raise NotImplementedError(_MOONEP_UNSUPPORTED_MESSAGE)
+    def _raise_unimplemented(operation: str) -> NoReturn:
+        raise NotImplementedError(
+            f"The current SGLang MoonEP BF16 reference path does not implement "
+            f"{operation}. "
+            f"{_MOONEP_SPLIT_PHASE_UNSUPPORTED_MESSAGE}"
+        )
 
     def _get_buffer(self):
         if self.hidden_size is None or self.num_experts is None:
@@ -548,11 +660,31 @@ class MoonEPDispatcher(BaseDispatcher):
             num_prefetch_slots=self.num_prefetch_slots,
         )
 
-    def _get_rank(self) -> int:
-        try:
-            return dist.get_rank(group=self.group)
-        except (AssertionError, RuntimeError, TypeError, ValueError):
-            return 0
+    def _validate_dispatch_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ) -> None:
+        if self.hidden_size is None:
+            raise ValueError("MoonEPDispatcher requires hidden_size.")
+        if hidden_states.shape[1] != self.hidden_size:
+            raise ValueError(
+                "MoonEP hidden_states width does not match configured hidden_size: "
+                f"width={hidden_states.shape[1]}, hidden_size={self.hidden_size}"
+            )
+        if hidden_states.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                "The current SGLang MoonEP BF16 reference dispatcher supports "
+                "BF16 hidden states only, "
+                f"got {hidden_states.dtype}."
+            )
+
+        topk_ids = topk_output.topk_ids
+        if topk_ids.shape[1] != self.router_topk:
+            raise ValueError(
+                "MoonEP routing width must match router_topk: "
+                f"width={topk_ids.shape[1]}, router_topk={self.router_topk}"
+            )
 
     def _pad_to_capacity(
         self,
@@ -562,6 +694,10 @@ class MoonEPDispatcher(BaseDispatcher):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         num_tokens = int(hidden_states.shape[0])
         capacity = int(self.num_max_dispatch_tokens_per_rank)
+        if capacity <= 0:
+            raise ValueError(
+                "MoonEP static buffer capacity must be positive, " f"got {capacity}."
+            )
         if num_tokens > capacity:
             raise ValueError(
                 "MoonEP runtime batch has more tokens than its static buffer "
@@ -576,6 +712,9 @@ class MoonEPDispatcher(BaseDispatcher):
             return hidden_states, topk_ids, topk_weights, num_tokens
 
         pad_tokens = capacity - num_tokens
+        # Known limitation of the current reference path: zero-padded rows use
+        # expert id 0, so planning counts include the padding under expert 0.
+        # Preserve this behavior until MoonEP exposes padding metadata.
         hidden_pad = hidden_states.new_zeros(pad_tokens, hidden_states.shape[1])
         id_pad = topk_ids.new_zeros(pad_tokens, topk_ids.shape[1])
         weight_pad = topk_weights.new_zeros(pad_tokens, topk_weights.shape[1])
@@ -587,34 +726,16 @@ class MoonEPDispatcher(BaseDispatcher):
         )
 
     def _tokens_per_expert(self, topk_ids: torch.Tensor) -> torch.Tensor:
-        assert self.num_experts is not None
-        return torch.bincount(
+        if self.num_experts is None or self.num_experts <= 0:
+            raise ValueError(
+                "MoonEPDispatcher requires a positive num_experts, "
+                f"got {self.num_experts}."
+            )
+        tokens_per_expert = torch.bincount(
             topk_ids.reshape(-1).to(dtype=torch.int64),
             minlength=self.num_experts,
-        ).to(dtype=torch.int32)
-
-    def _expert_ids_from_plan(
-        self,
-        cu_seqlens: torch.Tensor,
-        plan: Any,
-    ) -> torch.Tensor:
-        assert self.num_experts is not None
-        num_groups = int(cu_seqlens.numel())
-        expert_ids = torch.full_like(cu_seqlens, -1)
-        experts_to_copy = plan.experts_to_copy
-        if experts_to_copy.ndim == 2:
-            experts_to_copy = experts_to_copy[self._get_rank()]
-
-        prev = 0
-        for group_id in range(num_groups):
-            cur = int(cu_seqlens[group_id].item())
-            if cur > prev:
-                if group_id < self.num_experts:
-                    expert_ids[group_id] = group_id
-                else:
-                    expert_ids[group_id] = experts_to_copy[group_id - self.num_experts]
-            prev = cur
-        return expert_ids
+        )
+        return tokens_per_expert.to(dtype=torch.int32)
 
     def dispatch(
         self,
@@ -623,14 +744,12 @@ class MoonEPDispatcher(BaseDispatcher):
     ) -> DispatchOutput:
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise NotImplementedError(
-                "MoonEP PoC requires standard top-k output before dispatch."
-            )
-        if hidden_states.dtype != torch.bfloat16:
-            raise NotImplementedError(
-                "MoonEP PoC dispatcher supports BF16 hidden states only."
+                "The current SGLang MoonEP BF16 reference path requires standard "
+                "top-k output before dispatch."
             )
         if self.num_experts is None:
             raise ValueError("MoonEPDispatcher requires num_experts.")
+        self._validate_dispatch_inputs(hidden_states, topk_output)
 
         hidden_states, topk_ids, topk_weights, num_tokens = self._pad_to_capacity(
             hidden_states,
@@ -651,7 +770,6 @@ class MoonEPDispatcher(BaseDispatcher):
             route_weights_nvs=route_weights_nvs,
             cu_seqlens=cu_seqlens,
             plan=plan,
-            expert_ids=self._expert_ids_from_plan(cu_seqlens, plan),
             num_tokens=num_tokens,
         )
 
@@ -660,10 +778,10 @@ class MoonEPDispatcher(BaseDispatcher):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
-        self._raise_unimplemented()
+        self._raise_unimplemented("dispatch_a")
 
     def dispatch_b(self):
-        self._raise_unimplemented()
+        self._raise_unimplemented("dispatch_b")
 
     def combine(
         self,
@@ -686,10 +804,10 @@ class MoonEPDispatcher(BaseDispatcher):
         self,
         combine_input: CombineInput,
     ):
-        self._raise_unimplemented()
+        self._raise_unimplemented("combine_a")
 
     def combine_b(self):
-        self._raise_unimplemented()
+        self._raise_unimplemented("combine_b")
 
     def prefetch_weight(
         self,
@@ -705,4 +823,4 @@ class MoonEPDispatcher(BaseDispatcher):
         )
 
     def register_deepep_dispatch_hook(self, hook):
-        self._raise_unimplemented()
+        self._raise_unimplemented("register_deepep_dispatch_hook")

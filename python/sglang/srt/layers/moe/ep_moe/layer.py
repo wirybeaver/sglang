@@ -64,6 +64,16 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 logger = logging.getLogger(__name__)
 
 
+def _should_use_deepep_bf16_dispatch_fallback() -> bool:
+    """Return whether the deprecated DeepEP BF16 dispatch path applies."""
+
+    return (
+        deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+        and get_moe_a2a_backend().is_deepep()
+    )
+
+
 class DeepEPMoE(FusedMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
@@ -117,10 +127,7 @@ class DeepEPMoE(FusedMoE):
             quant_config, Fp8Config
         ):
             self.deprecate_flag = True
-        elif (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
-        ):
+        elif _should_use_deepep_bf16_dispatch_fallback():
             self.deprecate_flag = True
         elif (
             get_moe_runner_backend().is_flashinfer_cutedsl()
@@ -307,7 +314,7 @@ class DeepEPMoE(FusedMoE):
             weight_layout = get_moonep_expert_weight_layout(
                 self,
                 num_prefetch_slots=(
-                    int(dispatch_output.expert_ids.numel()) - self.num_experts
+                    int(dispatch_output.cu_seqlens.numel()) - self.num_experts
                 ),
             )
             self.dispatcher.prefetch_weight(
