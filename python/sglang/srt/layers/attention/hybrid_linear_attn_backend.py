@@ -1085,8 +1085,13 @@ class MambaAttnBackendBase(AttentionBackend):
         all-layers launch fired at the last mamba layer: the mask/src/dst
         indices are shared across layers and every layer's state is final by
         then, so the result is identical."""
-        if forward_batch.mamba_track_mask is None:
+        if (
+            self.req_to_token_pool.mamba_cache_prompt_only
+            or forward_batch.mamba_track_mask is None
+        ):
             return
+        else:
+            pass
         if layer_id is not None:
             pools = self._track_pools()
             if pools is not None:

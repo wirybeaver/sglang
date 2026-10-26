@@ -1538,6 +1538,13 @@ class SchedulerBatchResultProcessor:
         """
         if req.kv.mamba_ping_pong_track_buffer is None:
             return
+        elif (
+            batch.req_to_token_pool.mamba_cache_prompt_only
+            and batch.forward_mode.is_decode()
+        ):
+            return
+        else:
+            pass
 
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
         if known_boundary:
